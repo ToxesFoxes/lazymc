@@ -1,0 +1,124 @@
+# Сборка готовых бинарников для этого форка.
+# Upstream собирает релизы на GitLab CI, здесь то же самое на GitHub Actions:
+# тот же набор целей и те же имена файлов, что у релизов timvisee/lazymc.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Имя релиза (например v0.2.11-transfer.1)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: linux-x64-static
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            apt: musl-tools
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - name: linux-armv7
+            os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            apt: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+          - name: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+
+      - name: Point cargo at the cross linker
+        if: matrix.linker != ''
+        shell: bash
+        run: |
+          var="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          echo "$var=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Collect binary
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/lazymc.exe" "dist/lazymc-$tag-${{ matrix.name }}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/lazymc" "dist/lazymc-$tag-${{ matrix.name }}"
+            chmod +x "dist/lazymc-$tag-${{ matrix.name }}"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lazymc-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: ls -l dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          notes=".github/RELEASE_NOTES.md"
+          if [ ! -f "$notes" ]; then
+            printf 'Unofficial build of this fork.\n' > "$notes"
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "lazymc $tag" \
+              --notes-file "$notes" \
+              --target "${{ github.sha }}"
+          fi
